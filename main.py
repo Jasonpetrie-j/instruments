@@ -14,13 +14,16 @@ def ds1000z_demo():
     # sudo ifconfig enp7s0 inet 192.168.254.254 netmask 255.255.255.0
     # sudo ifconfig enp7s0 up
     # ip a show enp7s0
-    # Load configuration
+    # ping 192.168.254.100
+    
     try:
         with open('config.json', 'r') as f:
             config = json.load(f)
     except FileNotFoundError:
         print("Error: 'config.json' not found. Please check file path.")
-        return 
+        return
+
+    print(f"Connecting to Oscilloscope at {config['oscilloscope_ip']}...")
     try:
         instrument = DS1000Z(config['oscilloscope_ip'])
         instrument.reset()
@@ -29,7 +32,7 @@ def ds1000z_demo():
         print(f"\nConnection Failed: {e}")
         print("Hardware not found. Aborting demo to prevent crash.")
         return
-    instrument.reset()
+
     instrument.set_probe_ratio(1)
     instrument.show_channel()
     instrument.set_channel_scale(1)
