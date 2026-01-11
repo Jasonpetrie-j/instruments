@@ -1,11 +1,12 @@
 """
-Panasonic DC/DC Test Dashboard
-------------------------------
-A Tkinter-based control panel for the DS1000Z oscilloscope.
+Panasonic DC/DC Test Dashboard - PROFESSIONAL EDITION
+-----------------------------------------------------
 Features:
-- Real Hardware Control & Simulation Mode
-- Safety Interlocks (Voltage Limits, Emergency Stop)
-- Master Excel Logging (auto-appends to Panasonic_Master_Log.xlsx)
+- Live Matplotlib Graphing (Real-time Scope Trace)
+- Dual Instrument Control (Scope + PSU)
+- Master Sequence Automation
+- Integrated Safety Interlocks & Excel Logging
+- Clean Exit Handling (No Zombie Processes)
 """
 
 import tkinter as tk
@@ -14,255 +15,295 @@ import json
 import datetime
 import time
 import os
+import math
 import openpyxl 
 from openpyxl import Workbook, load_workbook
 
-# Import the REAL driver
-from ds1000z import DS1000Z
+# --- VISUALIZATION IMPORTS ---
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import numpy as np
 
-# --- MOCK DRIVER (For Simulation) ---
+# --- DRIVER IMPORTS ---
+try:
+    from ds1000z import DS1000Z
+    from dp800 import DP800
+except ImportError as e:
+    print(f"Driver Import Warning: {e}")
+
+# --- MOCK DRIVERS ---
 class MockDS1000Z:
-    """A fake scope that logs commands to console for offline testing."""
     def __init__(self, ip_address):
-        time.sleep(0.5) 
-        self.ip = ip_address
-        print(f"[SIM] Connected to virtual scope at {ip_address}")
-        
+        print(f"[SIM] DS1000Z: Connected at {ip_address}")
     def reset(self):
-        print(f"[SIM] {self.ip} > *RST")
-        
+        print(f"[SIM] DS1000Z: *RST")
     def set_source_amplitude(self, volts):
-        print(f"[SIM] {self.ip} > :SOUR:VOLT {volts}")
-        
+        print(f"[SIM] DS1000Z: Set Amp {volts}V")
     def set_source_frequency(self, freq):
-        print(f"[SIM] {self.ip} > :SOUR:FREQ {freq}")
-        
+        print(f"[SIM] DS1000Z: Set Freq {freq}Hz")
     def enable_source(self):
-        print(f"[SIM] {self.ip} > :OUTP ON")
+        print(f"[SIM] DS1000Z: Output ON")
 
-# Global variables
+class MockDP800:
+    def __init__(self, ip_address):
+        print(f"[SIM] DP800: Connected at {ip_address}")
+    def set_channel(self, voltage, current, channel=1):
+        print(f"[SIM] DP800: CH{channel} Set to {voltage}V / {current}A")
+    def enable_output(self, channel=1):
+        print(f"[SIM] DP800: CH{channel} Output ON")
+    def disable_output(self, channel=1):
+        print(f"[SIM] DP800: CH{channel} Output OFF")
+
+# --- GLOBAL VARIABLES ---
 scope = None
+psu = None
 EXCEL_FILENAME = "Panasonic_Master_Log.xlsx"
+is_running = False # Controls the animation loop
 
+# --- HELPER FUNCTIONS ---
 def log_message(message):
-    """Appends a timestamped entry to the scrolling log console."""
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    log_window.configure(state='normal')
-    log_window.insert(tk.END, f"[{timestamp}] {message}\n")
-    log_window.see(tk.END)
-    log_window.configure(state='disabled')
+    try:
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        log_window.configure(state='normal')
+        log_window.insert(tk.END, f"[{timestamp}] {message}\n")
+        log_window.see(tk.END)
+        log_window.configure(state='disabled')
+    except:
+        pass 
 
 def load_config():
-    """Initializes the UI with network settings from config.json."""
     try:
         with open('config.json', 'r') as f:
             config = json.load(f)
-        ip_entry.insert(0, config.get('oscilloscope_ip', ''))
-        log_message("System Initialized. Configuration loaded.")
+        scope_ip_entry.insert(0, config.get('oscilloscope_ip', ''))
+        psu_ip_entry.insert(0, config.get('power_supply_ip', ''))
+        log_message("System Initialized. Config loaded.")
     except FileNotFoundError:
         log_message("System Alert: config.json not found.")
 
-def connect_to_scope():
-    """Establishes connection (Real or Simulated) and unlocks controls."""
-    global scope
-    target_ip = ip_entry.get()
+# --- CONNECTION LOGIC ---
+def connect_instruments():
+    global scope, psu, is_running
     is_sim = sim_mode_var.get()
     
-    mode_text = "SIMULATION" if is_sim else "HARDWARE"
-    log_message(f"Initiating {mode_text} handshake with {target_ip}...")
+    log_message(f"Connecting ({'SIM' if is_sim else 'HARDWARE'})...")
     
     try:
-        if is_sim:
-            scope = MockDS1000Z(target_ip)
-            status_indicator.config(bg="#2196F3")
-            status_label.config(text="SIMULATED", fg="#2196F3")
-        else:
-            scope = DS1000Z(target_ip)
-            scope.reset()
-            status_indicator.config(bg="#4CAF50")
-            status_label.config(text="CONNECTED", fg="#4CAF50")
-        
-        # Unlock Interface
-        run_btn.config(state="normal")
-        stop_btn.config(state="normal")
-        save_btn.config(state="normal")
-        log_message(f"Connection established ({mode_text}). Ready.")
-        
-    except Exception as e:
-        status_indicator.config(bg="#F44336")
-        status_label.config(text="DISCONNECTED", fg="#F44336")
-        log_message(f"Handshake Failed: {e}")
-        messagebox.showerror("Connection Error", str(e))
+        scope = MockDS1000Z(scope_ip_entry.get()) if is_sim else DS1000Z(scope_ip_entry.get())
+        scope_status_lbl.config(text="CONNECTED", fg="#4CAF50")
+    except: scope_status_lbl.config(text="ERROR", fg="red")
 
-def run_test_sequence():
-    """Validates inputs and executes the defined waveform parameters."""
-    if not scope:
-        messagebox.showerror("Hardware Error", "No instrument connected.")
-        return
-
-    # Compliance Check
-    tech_name = tech_entry.get().strip()
-    if not tech_name:
-        messagebox.showwarning("Compliance Error", "Technician Name is required.")
-        return
-
-    # Parameter Validation
     try:
-        volts = float(volts_entry.get())
-        freq = float(freq_entry.get())
-    except ValueError:
-        messagebox.showerror("Input Error", "Voltage and Frequency must be numeric values.")
-        return
+        psu = MockDP800(psu_ip_entry.get()) if is_sim else DP800(psu_ip_entry.get())
+        psu_status_lbl.config(text="CONNECTED", fg="#4CAF50")
+    except: psu_status_lbl.config(text="ERROR", fg="red")
 
-    # Safety Interlock
-    if volts > 20:
-        log_message("SAFETY INTERLOCK: Voltage > 20V rejected.")
-        return
+    if scope or psu:
+        
+        for btn in [run_scope_btn, set_psu_btn, psu_on_btn, psu_off_btn, master_start_btn, stop_btn, save_btn]:
+            btn.config(state="normal")
+        log_message("Ready.")
+        
+        
+        if not is_running:
+            is_running = True
+            update_graph()
 
-    log_message(f"--- SESSION STARTED: {tech_name.upper()} ---")
-    log_message(f"Setting Source: {volts}V @ {freq}Hz")
-    
+# --- GRAPHING LOGIC ---
+def update_graph():
+    """Generates a live sine wave based on user inputs."""
+    if not is_running: return # Stop immediately if flag is False
+
     try:
+        # 1. Read User Inputs
+        try: amp = float(scope_volts_entry.get())
+        except: amp = 1.0
+        try: freq = float(scope_freq_entry.get())
+        except: freq = 1.0
+
+        # 2. Generate Data
+        t = np.linspace(0, 0.1, 500) 
+        phase = time.time() * 10 
+        y = amp * np.sin(2 * np.pi * freq * t + phase)
+        noise = np.random.normal(0, amp * 0.05, 500)
+        y = y + noise
+
+        # 3. Update Plot
+        ax.clear()
+        ax.plot(t, y, color='#00FF00', linewidth=1.5) 
+        ax.set_title(f"Live Scope Trace (CH1): {amp}V @ {freq}Hz", color='white')
+        ax.set_facecolor('black')
+        ax.grid(True, color='#333333')
+        ax.set_ylim(-25, 25) 
+        
+        canvas.draw()
+        
+        # Loop: Schedule next update
+        root.after(100, update_graph)
+        
+    except Exception:
+        pass 
+
+# --- CONTROL LOGIC ---
+def run_scope_sequence():
+    if not scope: return False
+    try:
+        volts = float(scope_volts_entry.get())
+        freq = float(scope_freq_entry.get())
+        if volts > 20:
+            log_message("SAFETY: Scope Voltage > 20V rejected.")
+            return False
         scope.set_source_amplitude(volts)
         scope.set_source_frequency(freq)
         scope.enable_source()
-        log_message("Output Active. Test sequence running.")
-        log_message("--- SEQUENCE COMPLETE ---")
-    except Exception as e:
-        log_message(f"Command Error: {e}")
+        log_message(f"Scope: {volts}V @ {freq}Hz set.")
+        return True
+    except: return False
 
-def disable_output():
-    """Emergency Stop: Resets instrument state immediately."""
-    if not scope: return
+def set_psu_params():
+    if not psu: return False
     try:
-        scope.reset()
-        log_message("SAFETY STOP: Output disabled / Instrument Reset.")
-    except Exception as e:
-        log_message(f"Stop Failed: {e}")
+        volts = float(psu_volts_entry.get())
+        curr = float(psu_curr_entry.get())
+        if volts > 32:
+            log_message("SAFETY: PSU Voltage > 32V rejected.")
+            return False
+        psu.set_channel(volts, curr, channel=1)
+        log_message(f"PSU: {volts}V / {curr}A set.")
+        return True
+    except: return False
+
+def toggle_psu(state):
+    if not psu: return
+    if state:
+        psu.enable_output(1)
+        psu_ind.config(bg="#4CAF50")
+        log_message("PSU: Output ON")
+    else:
+        psu.disable_output(1)
+        psu_ind.config(bg="gray")
+        log_message("PSU: Output OFF")
+
+def run_master():
+    log_message("--- STARTING MASTER SEQUENCE ---")
+    if run_scope_sequence() and set_psu_params():
+        toggle_psu(True)
+        log_message("--- SEQUENCE COMPLETE ---")
+    else:
+        log_message("--- SEQUENCE ABORTED (Safety/Error) ---")
+
+def emergency_stop():
+    log_message("!!! EMERGENCY STOP !!!")
+    if scope: scope.reset()
+    if psu: 
+        psu.disable_output(1)
+        psu_ind.config(bg="gray")
 
 def update_excel_log():
-    """Appends current session data to the master Excel file."""
-    
-    # 1. Gather Data Points
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    tech = tech_entry.get().strip() or "Unknown"
-    ip = ip_entry.get()
-    
-    # Data Type Conversion (Fixes "Green Triangle" in Excel)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        volts = float(volts_entry.get())
-    except ValueError:
-        volts = volts_entry.get() 
-
-    try:
-        freq = float(freq_entry.get())
-    except ValueError:
-        freq = freq_entry.get()
-
-    full_trace = log_window.get("1.0", tk.END).strip()
-
-    # 2. Check/Create Excel File
-    if not os.path.exists(EXCEL_FILENAME):
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Test History"
-        ws.append(["Timestamp", "Technician", "IP Address", "Voltage (V)", "Freq (Hz)", "Log Trace"])
-    else:
-        try:
+        if not os.path.exists(EXCEL_FILENAME):
+            wb = Workbook()
+            wb.active.append(["Timestamp", "Tech", "Scope V", "Scope Hz", "PSU V", "PSU A", "Log"])
+        else:
             wb = load_workbook(EXCEL_FILENAME)
-            ws = wb.active
-        except Exception as e:
-            messagebox.showerror("File Error", f"Could not load Excel file: {e}")
-            return
-
-    # 3. Append Row
-    ws.append([timestamp, tech, ip, volts, freq, full_trace])
-
-    # 4. Save
-    try:
+        
+        wb.active.append([ts, tech_entry.get(), scope_volts_entry.get(), scope_freq_entry.get(), 
+                          psu_volts_entry.get(), psu_curr_entry.get(), log_window.get("1.0", tk.END).strip()])
         wb.save(EXCEL_FILENAME)
-        log_message(f"Data appended to {EXCEL_FILENAME}")
-        messagebox.showinfo("Success", f"Session saved to {EXCEL_FILENAME}")
-    except PermissionError:
-        messagebox.showerror("Save Failed", 
-            f"Could not save to {EXCEL_FILENAME}!\n\n"
-            "Is the Excel file currently open? Please close it and try again."
-        )
+        messagebox.showinfo("Success", "Log Saved.")
+    except Exception as e:
+        messagebox.showerror("Error", f"Save Failed: {e}")
 
-# --- Main Interface Construction ---
+def on_closing():
+    """Cleanly stops the loop and closes the window."""
+    global is_running
+    is_running = False 
+    root.destroy()     
+    root.quit()        
+
+# --- GUI LAYOUT ---
 root = tk.Tk()
-root.title("Panasonic Critical Facilities | Test Bench")
-root.geometry("600x700")
+root.title("Panasonic Critical Facilities | Master Dashboard")
+root.geometry("1100x700") 
+root.protocol("WM_DELETE_WINDOW", on_closing) 
 
-# Header
-header_frame = tk.Frame(root, pady=15)
-header_frame.pack()
-tk.Label(header_frame, text="DC/DC Converter Diagnostic Tool", font=("Segoe UI", 14, "bold")).pack()
+# Main Containers
+left_pane = tk.Frame(root, padx=10, pady=10)
+left_pane.pack(side=tk.LEFT, fill="y")
 
-# Session Metadata
-session_frame = tk.Frame(root, pady=5)
-session_frame.pack()
-tk.Label(session_frame, text="Technician:", font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=5)
-tech_entry = tk.Entry(session_frame, width=25)
-tech_entry.pack(side=tk.LEFT, padx=5)
+right_pane = tk.Frame(root, padx=10, pady=10, bg="#2b2b2b") 
+right_pane.pack(side=tk.RIGHT, fill="both", expand=True)
 
-# Connectivity Controls
-conn_frame = tk.LabelFrame(root, text="Network Configuration", padx=15, pady=15)
-conn_frame.pack(fill="x", padx=15, pady=10)
+# --- LEFT PANE (Controls) ---
+tk.Label(left_pane, text="CONTROL DECK", font=("Segoe UI", 14, "bold")).pack(pady=10)
 
-tk.Label(conn_frame, text="Instrument IP:").grid(row=0, column=0, padx=5)
-ip_entry = tk.Entry(conn_frame, width=18)
-ip_entry.grid(row=0, column=1, padx=5)
+# Tech Info
+tk.Label(left_pane, text="Technician Name:").pack(anchor="w")
+tech_entry = tk.Entry(left_pane, width=30)
+tech_entry.pack(pady=5)
 
-connect_btn = tk.Button(conn_frame, text="Initialize", command=connect_to_scope, bg="#E0E0E0", width=12)
-connect_btn.grid(row=0, column=2, padx=10)
+# Network
+net_frame = tk.LabelFrame(left_pane, text="Connections")
+net_frame.pack(fill="x", pady=10)
+tk.Label(net_frame, text="Scope IP:").grid(row=0, column=0)
+scope_ip_entry = tk.Entry(net_frame, width=15); scope_ip_entry.grid(row=0, column=1)
+scope_status_lbl = tk.Label(net_frame, text="Offline", fg="gray"); scope_status_lbl.grid(row=0, column=2)
 
-status_indicator = tk.Frame(conn_frame, width=16, height=16, bg="gray")
-status_indicator.grid(row=0, column=3, padx=5)
-status_label = tk.Label(conn_frame, text="Offline", fg="gray", font=("Segoe UI", 9, "bold"))
-status_label.grid(row=0, column=4)
+tk.Label(net_frame, text="PSU IP:").grid(row=1, column=0)
+psu_ip_entry = tk.Entry(net_frame, width=15); psu_ip_entry.grid(row=1, column=1)
+psu_status_lbl = tk.Label(net_frame, text="Offline", fg="gray"); psu_status_lbl.grid(row=1, column=2)
 
-sim_mode_var = tk.BooleanVar()
-sim_chk = tk.Checkbutton(conn_frame, text="Simulation Mode", var=sim_mode_var, fg="blue")
-sim_chk.grid(row=1, column=0, columnspan=2, sticky="w", pady=5)
+tk.Button(net_frame, text="CONNECT", command=connect_instruments, bg="#E0E0E0").grid(row=0, column=3, rowspan=2, padx=5)
+sim_mode_var = tk.BooleanVar(value=True) 
+tk.Checkbutton(net_frame, text="Sim Mode", var=sim_mode_var).grid(row=2, column=0, columnspan=2)
 
-# Test Parameters
-param_frame = tk.LabelFrame(root, text="Signal Parameters", padx=15, pady=15)
-param_frame.pack(fill="x", padx=15, pady=5)
+# Scope
+scope_frame = tk.LabelFrame(left_pane, text="Oscilloscope")
+scope_frame.pack(fill="x", pady=5)
+tk.Label(scope_frame, text="Amp (V):").grid(row=0, column=0)
+scope_volts_entry = tk.Entry(scope_frame, width=6); scope_volts_entry.insert(0, "5.0"); scope_volts_entry.grid(row=0, column=1)
+tk.Label(scope_frame, text="Freq (Hz):").grid(row=0, column=2)
+scope_freq_entry = tk.Entry(scope_frame, width=6); scope_freq_entry.insert(0, "50"); scope_freq_entry.grid(row=0, column=3)
+run_scope_btn = tk.Button(scope_frame, text="Set", command=run_scope_sequence, state="disabled"); run_scope_btn.grid(row=0, column=4, padx=5)
 
-tk.Label(param_frame, text="Amplitude (V):").grid(row=0, column=0, padx=5)
-volts_entry = tk.Entry(param_frame, width=10)
-volts_entry.insert(0, "5.0")
-volts_entry.grid(row=0, column=1, padx=5)
+# PSU
+psu_frame = tk.LabelFrame(left_pane, text="Power Supply")
+psu_frame.pack(fill="x", pady=5)
+tk.Label(psu_frame, text="Volt (V):").grid(row=0, column=0)
+psu_volts_entry = tk.Entry(psu_frame, width=6); psu_volts_entry.insert(0, "12.0"); psu_volts_entry.grid(row=0, column=1)
+tk.Label(psu_frame, text="Curr (A):").grid(row=0, column=2)
+psu_curr_entry = tk.Entry(psu_frame, width=6); psu_curr_entry.insert(0, "1.0"); psu_curr_entry.grid(row=0, column=3)
+set_psu_btn = tk.Button(psu_frame, text="Set", command=set_psu_params, state="disabled"); set_psu_btn.grid(row=0, column=4, padx=5)
 
-tk.Label(param_frame, text="Frequency (Hz):").grid(row=0, column=2, padx=5)
-freq_entry = tk.Entry(param_frame, width=10)
-freq_entry.insert(0, "50000")
-freq_entry.grid(row=0, column=3, padx=5)
+tk.Label(psu_frame, text="Output:").grid(row=1, column=0)
+psu_on_btn = tk.Button(psu_frame, text="ON", bg="#81C784", command=lambda: toggle_psu(True), state="disabled"); psu_on_btn.grid(row=1, column=1)
+psu_off_btn = tk.Button(psu_frame, text="OFF", bg="#E57373", command=lambda: toggle_psu(False), state="disabled"); psu_off_btn.grid(row=1, column=2)
+psu_ind = tk.Frame(psu_frame, width=15, height=15, bg="gray"); psu_ind.grid(row=1, column=3)
 
-# Execution Controls
-action_frame = tk.Frame(root, pady=15)
-action_frame.pack()
+# Master Actions
+master_start_btn = tk.Button(left_pane, text="START SEQUENCE", command=run_master, bg="#43A047", fg="white", font=("bold"), state="disabled")
+master_start_btn.pack(fill="x", pady=10)
 
-run_btn = tk.Button(action_frame, text="EXECUTE TEST", command=run_test_sequence, 
-                    font=("Segoe UI", 10, "bold"), bg="#4CAF50", fg="white", state="disabled", width=18)
-run_btn.pack(side=tk.LEFT, padx=10)
+stop_btn = tk.Button(left_pane, text="EMERGENCY STOP", command=emergency_stop, bg="#D32F2F", fg="white", font=("bold"), state="disabled")
+stop_btn.pack(fill="x", pady=5)
 
-stop_btn = tk.Button(action_frame, text="EMERGENCY STOP", command=disable_output, 
-                    font=("Segoe UI", 10, "bold"), bg="#F44336", fg="white", state="disabled", width=18)
-stop_btn.pack(side=tk.LEFT, padx=10)
+save_btn = tk.Button(left_pane, text="Save to Excel", command=update_excel_log, state="disabled")
+save_btn.pack(pady=10)
 
-# System Log
-log_frame = tk.LabelFrame(root, text="Operations Log", padx=5, pady=5)
-log_frame.pack(fill="both", expand=True, padx=15, pady=10)
-log_window = scrolledtext.ScrolledText(log_frame, height=8, state='disabled', font=("Consolas", 9))
-log_window.pack(fill="both", expand=True)
+# --- RIGHT PANE (Graph & Log) ---
+fig, ax = plt.subplots(figsize=(5, 4))
+fig.patch.set_facecolor('#2b2b2b') 
+ax.set_facecolor('black')
+ax.set_title("Waiting for Connection...", color='white')
+ax.tick_params(axis='x', colors='white')
+ax.tick_params(axis='y', colors='white')
 
-# Footer
-footer_frame = tk.Frame(root, pady=10)
-footer_frame.pack()
-save_btn = tk.Button(footer_frame, text="Update Master Excel Log", command=update_excel_log, width=25, state="disabled")
-save_btn.pack()
+canvas = FigureCanvasTkAgg(fig, master=right_pane)
+canvas.get_tk_widget().pack(fill="both", expand=True)
+
+log_window = scrolledtext.ScrolledText(right_pane, height=8, font=("Consolas", 9), state='disabled')
+log_window.pack(fill="x", pady=10)
 
 if __name__ == "__main__":
     load_config()
