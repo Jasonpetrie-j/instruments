@@ -2,18 +2,47 @@
 Panasonic DC/DC Test Dashboard
 ------------------------------
 A Tkinter-based control panel for the DS1000Z oscilloscope.
-Provides safety interlocks, input validation, and test session logging
-for critical facilities testing.
+Features:
+- Real Hardware Control & Simulation Mode
+- Safety Interlocks (Voltage Limits, Emergency Stop)
+- Master Excel Logging (auto-appends to Panasonic_Master_Log.xlsx)
 """
 
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, filedialog
+from tkinter import messagebox, scrolledtext
 import json
 import datetime
+import time
+import os
+import openpyxl 
+from openpyxl import Workbook, load_workbook
+
+# Import the REAL driver
 from ds1000z import DS1000Z
 
-# Global instrument reference
+# --- MOCK DRIVER (For Simulation) ---
+class MockDS1000Z:
+    """A fake scope that logs commands to console for offline testing."""
+    def __init__(self, ip_address):
+        time.sleep(0.5) 
+        self.ip = ip_address
+        print(f"[SIM] Connected to virtual scope at {ip_address}")
+        
+    def reset(self):
+        print(f"[SIM] {self.ip} > *RST")
+        
+    def set_source_amplitude(self, volts):
+        print(f"[SIM] {self.ip} > :SOUR:VOLT {volts}")
+        
+    def set_source_frequency(self, freq):
+        print(f"[SIM] {self.ip} > :SOUR:FREQ {freq}")
+        
+    def enable_source(self):
+        print(f"[SIM] {self.ip} > :OUTP ON")
+
+# Global variables
 scope = None
+EXCEL_FILENAME = "Panasonic_Master_Log.xlsx"
 
 def log_message(message):
     """Appends a timestamped entry to the scrolling log console."""
@@ -34,22 +63,30 @@ def load_config():
         log_message("System Alert: config.json not found.")
 
 def connect_to_scope():
-    """Establishes connection to hardware and unlocks control interface."""
+    """Establishes connection (Real or Simulated) and unlocks controls."""
     global scope
     target_ip = ip_entry.get()
+    is_sim = sim_mode_var.get()
     
-    log_message(f"Initiating handshake with {target_ip}...")
+    mode_text = "SIMULATION" if is_sim else "HARDWARE"
+    log_message(f"Initiating {mode_text} handshake with {target_ip}...")
     
     try:
-        scope = DS1000Z(target_ip)
-        scope.reset()
+        if is_sim:
+            scope = MockDS1000Z(target_ip)
+            status_indicator.config(bg="#2196F3")
+            status_label.config(text="SIMULATED", fg="#2196F3")
+        else:
+            scope = DS1000Z(target_ip)
+            scope.reset()
+            status_indicator.config(bg="#4CAF50")
+            status_label.config(text="CONNECTED", fg="#4CAF50")
         
-        # Update Interface State
-        status_indicator.config(bg="#4CAF50")
-        status_label.config(text="CONNECTED", fg="#4CAF50")
+        # Unlock Interface
         run_btn.config(state="normal")
         stop_btn.config(state="normal")
-        log_message("Connection established. Hardware reset complete.")
+        save_btn.config(state="normal")
+        log_message(f"Connection established ({mode_text}). Ready.")
         
     except Exception as e:
         status_indicator.config(bg="#F44336")
@@ -66,7 +103,7 @@ def run_test_sequence():
     # Compliance Check
     tech_name = tech_entry.get().strip()
     if not tech_name:
-        messagebox.showwarning("Compliance Error", "Technician Name is required to proceed.")
+        messagebox.showwarning("Compliance Error", "Technician Name is required.")
         return
 
     # Parameter Validation
@@ -96,39 +133,66 @@ def run_test_sequence():
 
 def disable_output():
     """Emergency Stop: Resets instrument state immediately."""
-    if not scope:
-        return
+    if not scope: return
     try:
         scope.reset()
         log_message("SAFETY STOP: Output disabled / Instrument Reset.")
     except Exception as e:
         log_message(f"Stop Failed: {e}")
 
-def save_report():
-    """Exports the current session log to a text file."""
-    tech_name = tech_entry.get().strip() or "Unknown"
-    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M')
-    default_filename = f"TestReport_{tech_name}_{timestamp}.txt"
+def update_excel_log():
+    """Appends current session data to the master Excel file."""
     
-    filepath = filedialog.asksaveasfilename(
-        defaultextension=".txt",
-        initialfile=default_filename,
-        title="Export Test Report"
-    )
+    # 1. Gather Data Points
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tech = tech_entry.get().strip() or "Unknown"
+    ip = ip_entry.get()
     
-    if filepath:
+    # Data Type Conversion (Fixes "Green Triangle" in Excel)
+    try:
+        volts = float(volts_entry.get())
+    except ValueError:
+        volts = volts_entry.get() 
+
+    try:
+        freq = float(freq_entry.get())
+    except ValueError:
+        freq = freq_entry.get()
+
+    full_trace = log_window.get("1.0", tk.END).strip()
+
+    # 2. Check/Create Excel File
+    if not os.path.exists(EXCEL_FILENAME):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Test History"
+        ws.append(["Timestamp", "Technician", "IP Address", "Voltage (V)", "Freq (Hz)", "Log Trace"])
+    else:
         try:
-            with open(filepath, "w") as f:
-                f.write(log_window.get("1.0", tk.END))
-            log_message(f"Report exported: {filepath}")
-            messagebox.showinfo("Export Complete", "Log file saved successfully.")
+            wb = load_workbook(EXCEL_FILENAME)
+            ws = wb.active
         except Exception as e:
-            messagebox.showerror("Export Error", str(e))
+            messagebox.showerror("File Error", f"Could not load Excel file: {e}")
+            return
+
+    # 3. Append Row
+    ws.append([timestamp, tech, ip, volts, freq, full_trace])
+
+    # 4. Save
+    try:
+        wb.save(EXCEL_FILENAME)
+        log_message(f"Data appended to {EXCEL_FILENAME}")
+        messagebox.showinfo("Success", f"Session saved to {EXCEL_FILENAME}")
+    except PermissionError:
+        messagebox.showerror("Save Failed", 
+            f"Could not save to {EXCEL_FILENAME}!\n\n"
+            "Is the Excel file currently open? Please close it and try again."
+        )
 
 # --- Main Interface Construction ---
 root = tk.Tk()
-root.title("Panasonic DC/DC Diagnostic | Test Bench")
-root.geometry("600x650")
+root.title("Panasonic Critical Facilities | Test Bench")
+root.geometry("600x700")
 
 # Header
 header_frame = tk.Frame(root, pady=15)
@@ -157,6 +221,10 @@ status_indicator = tk.Frame(conn_frame, width=16, height=16, bg="gray")
 status_indicator.grid(row=0, column=3, padx=5)
 status_label = tk.Label(conn_frame, text="Offline", fg="gray", font=("Segoe UI", 9, "bold"))
 status_label.grid(row=0, column=4)
+
+sim_mode_var = tk.BooleanVar()
+sim_chk = tk.Checkbutton(conn_frame, text="Simulation Mode", var=sim_mode_var, fg="blue")
+sim_chk.grid(row=1, column=0, columnspan=2, sticky="w", pady=5)
 
 # Test Parameters
 param_frame = tk.LabelFrame(root, text="Signal Parameters", padx=15, pady=15)
@@ -193,7 +261,7 @@ log_window.pack(fill="both", expand=True)
 # Footer
 footer_frame = tk.Frame(root, pady=10)
 footer_frame.pack()
-save_btn = tk.Button(footer_frame, text="Export Session Log", command=save_report, width=20)
+save_btn = tk.Button(footer_frame, text="Update Master Excel Log", command=update_excel_log, width=25, state="disabled")
 save_btn.pack()
 
 if __name__ == "__main__":
